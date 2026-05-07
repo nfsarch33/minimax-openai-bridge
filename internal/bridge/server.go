@@ -10,15 +10,23 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/nfsarch33/runx/pkg/minimaxauth"
 )
 
 const embeddingPath = "/v1/embeddings"
 
 type Server struct {
-	cfg    Config
-	client *http.Client
-	log    *slog.Logger
+	cfg     Config
+	client  *http.Client
+	log     *slog.Logger
+	auth    *minimaxauth.Service
+	secrets minimaxauth.SecretLoader
+	aliases []minimaxauth.KeyAlias
+	clock   func() time.Time
 }
 
 func NewServer(cfg Config, client *http.Client, log *slog.Logger) *Server {
@@ -28,7 +36,89 @@ func NewServer(cfg Config, client *http.Client, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, client: client, log: log}
+	auth := newAuthRuntime(cfg, log)
+	return &Server{
+		cfg:     cfg,
+		client:  client,
+		log:     log,
+		auth:    auth.service,
+		secrets: auth.secrets,
+		aliases: auth.aliases,
+		clock:   auth.clock,
+	}
+}
+
+type authRuntime struct {
+	service *minimaxauth.Service
+	secrets minimaxauth.SecretLoader
+	aliases []minimaxauth.KeyAlias
+	clock   func() time.Time
+}
+
+func newAuthRuntime(cfg Config, log *slog.Logger) authRuntime {
+	clock := configClock(cfg)
+	bindings := configKeyBindings(cfg)
+	aliases := bindingAliases(bindings)
+	auth := newAuthService(cfg, aliases, clock, configEventWriter(cfg, log), log)
+	secrets := cfg.SecretLoader
+	if secrets == nil {
+		secrets = newEnvSecretLoader(bindings)
+	}
+	return authRuntime{service: auth, secrets: secrets, aliases: aliases, clock: clock}
+}
+
+func configClock(cfg Config) func() time.Time {
+	if cfg.Clock != nil {
+		return cfg.Clock
+	}
+	return func() time.Time { return time.Now().UTC() }
+}
+
+func configKeyBindings(cfg Config) []apiKeyBinding {
+	if len(cfg.KeyBindings) > 0 {
+		return cfg.KeyBindings
+	}
+	return bindingsFromKeys(apiKeysFromConfig(cfg))
+}
+
+func bindingAliases(bindings []apiKeyBinding) []minimaxauth.KeyAlias {
+	aliases := make([]minimaxauth.KeyAlias, 0, len(bindings))
+	for _, binding := range bindings {
+		aliases = append(aliases, binding.alias)
+	}
+	return aliases
+}
+
+func configEventWriter(cfg Config, log *slog.Logger) minimaxauth.EventWriter {
+	if cfg.EventWriter != nil {
+		return cfg.EventWriter
+	}
+	if cfg.EventLogPath == "" {
+		return minimaxauth.NoopWriter{}
+	}
+	opened, err := minimaxauth.OpenNDJSONWriter(cfg.EventLogPath)
+	if err != nil {
+		log.Warn("minimax event log disabled", "err", err)
+		return minimaxauth.NoopWriter{}
+	}
+	return opened
+}
+
+func newAuthService(cfg Config, aliases []minimaxauth.KeyAlias, clock func() time.Time, writer minimaxauth.EventWriter, log *slog.Logger) *minimaxauth.Service {
+	auth, err := minimaxauth.NewService(
+		minimaxauth.StaticSource(aliases),
+		&minimaxauth.StickyWithFailoverSelector{Backoff: cfg.SelectorBackoff},
+		minimaxauth.WithClock(clock),
+		minimaxauth.WithEventWriter(writer),
+	)
+	if err != nil {
+		log.Warn("minimax auth service disabled", "err", err)
+		return nil
+	}
+	if err := auth.Refresh(context.Background()); err != nil {
+		log.Warn("minimax auth refresh failed", "err", err)
+	}
+	return auth
 }
 
 func (s *Server) Handler() http.Handler {
@@ -111,62 +201,105 @@ func (s *Server) embed(ctx context.Context, model, embedType string, texts []str
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	for idx, apiKey := range s.apiKeys() {
-		raw, status, err := s.postMiniMaxWithKey(ctx, "embeddings", body, apiKey)
+	var lastErr error
+	for attempt := 0; attempt < s.maxAttempts(); attempt++ {
+		alias, err := s.pickAlias()
 		if err != nil {
-			if isProviderRetryable(status, nil, err) && idx+1 < len(s.apiKeys()) {
-				continue
+			if lastErr != nil {
+				return nil, lastErr
 			}
 			return nil, err
 		}
-		parsed, err := decodeEmbeddingResponse(raw)
-		if err != nil {
-			return nil, err
+		vectors, retry, err := s.tryEmbedding(ctx, body, texts, alias)
+		if err == nil {
+			return vectors, nil
 		}
-		if parsed.BaseResp.StatusCode != 0 {
-			providerErr := fmt.Errorf("minimax base_resp %d: %s", parsed.BaseResp.StatusCode, parsed.BaseResp.StatusMsg)
-			if isProviderRetryable(status, raw, providerErr) && idx+1 < len(s.apiKeys()) {
-				continue
-			}
-			return nil, providerErr
+		if retry && attempt+1 < s.maxAttempts() {
+			lastErr = err
+			continue
 		}
-		if len(parsed.Vectors) != len(texts) {
-			return nil, fmt.Errorf("vector count %d != input count %d", len(parsed.Vectors), len(texts))
-		}
-		return parsed.Vectors, nil
+		return nil, err
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, errors.New("missing MiniMax API keys")
 }
 
+func (s *Server) tryEmbedding(ctx context.Context, body []byte, texts []string, alias minimaxauth.KeyAlias) ([][]float64, bool, error) {
+	raw, status, header, err := s.postMiniMaxWithAlias(ctx, "embeddings", body, alias)
+	if err != nil {
+		return nil, s.recordObservation(alias, classifyProviderObservation(status, raw, err), header), err
+	}
+	parsed, err := decodeEmbeddingResponse(raw)
+	if err != nil {
+		return nil, s.recordObservation(alias, classifyProviderObservation(status, raw, err), header), err
+	}
+	if err := validateEmbeddingResponse(parsed, len(texts)); err != nil {
+		return nil, s.recordObservation(alias, classifyProviderObservation(status, raw, err), header), err
+	}
+	_ = s.auth.RecordSuccess(alias, s.clock())
+	return parsed.Vectors, false, nil
+}
+
+func validateEmbeddingResponse(parsed minimaxEmbeddingResponse, wantVectors int) error {
+	if parsed.BaseResp.StatusCode != 0 {
+		return fmt.Errorf("minimax base_resp %d: %s", parsed.BaseResp.StatusCode, parsed.BaseResp.StatusMsg)
+	}
+	if len(parsed.Vectors) != wantVectors {
+		return fmt.Errorf("vector count %d != input count %d", len(parsed.Vectors), wantVectors)
+	}
+	return nil
+}
+
 func (s *Server) postMiniMax(ctx context.Context, path string, body []byte) ([]byte, int, error) {
-	keys := s.apiKeys()
-	if len(keys) == 0 {
+	if s.maxAttempts() == 0 {
 		return nil, 0, errors.New("missing MiniMax API keys")
 	}
 	var lastErr error
 	var lastStatus int
 	var lastBody []byte
-	for idx, apiKey := range keys {
-		raw, status, err := s.postMiniMaxWithKey(ctx, path, body, apiKey)
-		if err == nil {
+	for attempt := 0; attempt < s.maxAttempts(); attempt++ {
+		alias, err := s.pickAlias()
+		if err != nil {
+			if lastErr != nil {
+				return lastBody, lastStatus, lastErr
+			}
+			return nil, 0, err
+		}
+		raw, status, header, err := s.postMiniMaxWithAlias(ctx, path, body, alias)
+		observation := classifyProviderObservation(status, raw, err)
+		if err == nil && observation == providerObservationSuccess {
+			_ = s.auth.RecordSuccess(alias, s.clock())
 			return raw, status, nil
 		}
+		if err == nil {
+			err = fmt.Errorf("minimax retryable response body")
+		}
 		lastErr, lastStatus, lastBody = err, status, raw
-		if !isProviderRetryable(status, raw, err) || idx+1 == len(keys) {
+		if !s.recordObservation(alias, observation, header) || attempt+1 == s.maxAttempts() {
 			break
 		}
 	}
 	return lastBody, lastStatus, lastErr
 }
 
-func (s *Server) postMiniMaxWithKey(ctx context.Context, path string, body []byte, apiKey string) ([]byte, int, error) {
+func (s *Server) postMiniMaxWithAlias(ctx context.Context, path string, body []byte, alias minimaxauth.KeyAlias) ([]byte, int, http.Header, error) {
+	apiKey, err := s.secrets.Load(ctx, alias)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return s.postMiniMaxWithKey(ctx, path, body, string(apiKey))
+}
+
+func (s *Server) postMiniMaxWithKey(ctx context.Context, path string, body []byte, apiKey string) ([]byte, int, http.Header, error) {
 	endpoint, err := url.JoinPath(strings.TrimRight(s.cfg.MiniMaxBaseURL, "/"), path)
 	if err != nil {
-		return nil, 0, fmt.Errorf("endpoint: %w", err)
+		return nil, 0, nil, fmt.Errorf("endpoint: %w", err)
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, 0, fmt.Errorf("parse endpoint: %w", err)
+		return nil, 0, nil, fmt.Errorf("parse endpoint: %w", err)
 	}
 	if s.cfg.GroupID != "" {
 		q := u.Query()
@@ -175,33 +308,134 @@ func (s *Server) postMiniMaxWithKey(ctx context.Context, path string, body []byt
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("request: %w", err)
+		return nil, 0, nil, fmt.Errorf("request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("post: %w", err)
+		return nil, 0, nil, fmt.Errorf("post: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("read: %w", err)
+		return nil, resp.StatusCode, resp.Header, fmt.Errorf("read: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return raw, resp.StatusCode, fmt.Errorf("minimax status %d", resp.StatusCode)
+		return raw, resp.StatusCode, resp.Header, fmt.Errorf("minimax status %d", resp.StatusCode)
 	}
-	return raw, resp.StatusCode, nil
+	return raw, resp.StatusCode, resp.Header, nil
 }
 
 func (s *Server) apiKeys() []string {
-	if len(s.cfg.APIKeys) > 0 {
-		return s.cfg.APIKeys
+	return apiKeysFromConfig(s.cfg)
+}
+
+func apiKeysFromConfig(cfg Config) []string {
+	if len(cfg.APIKeys) > 0 {
+		return cfg.APIKeys
 	}
-	if s.cfg.APIKey == "" {
+	if cfg.APIKey == "" {
 		return nil
 	}
-	return []string{s.cfg.APIKey}
+	return []string{cfg.APIKey}
+}
+
+func (s *Server) maxAttempts() int {
+	return len(s.aliases)
+}
+
+func (s *Server) pickAlias() (minimaxauth.KeyAlias, error) {
+	if s.auth == nil {
+		return "", errors.New("minimax auth service unavailable")
+	}
+	return s.auth.Pick()
+}
+
+type providerObservation int
+
+const (
+	providerObservationSuccess providerObservation = iota
+	providerObservationRateLimited
+	providerObservationQuotaExhausted
+	providerObservationFailure
+)
+
+func (s *Server) recordObservation(alias minimaxauth.KeyAlias, observation providerObservation, header http.Header) bool {
+	switch observation {
+	case providerObservationRateLimited:
+		_ = s.auth.RecordRateLimited(alias, s.clock(), parseRetryAfter(header, s.clock()))
+		return true
+	case providerObservationQuotaExhausted:
+		_ = s.auth.RecordQuotaExhausted(alias, s.clock(), time.Time{})
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyProviderObservation(status int, raw []byte, err error) providerObservation {
+	if status == http.StatusTooManyRequests {
+		return providerObservationRateLimited
+	}
+	if status == http.StatusPaymentRequired || status == http.StatusForbidden {
+		return providerObservationQuotaExhausted
+	}
+	lower := strings.ToLower(string(raw))
+	if err != nil {
+		lower += " " + strings.ToLower(err.Error())
+	}
+	switch {
+	case strings.Contains(lower, "quota"),
+		strings.Contains(lower, "insufficient balance"),
+		strings.Contains(lower, "payment required"):
+		return providerObservationQuotaExhausted
+	case strings.Contains(lower, "rate limit"),
+		strings.Contains(lower, "rate_limit"),
+		strings.Contains(lower, "too many requests"):
+		return providerObservationRateLimited
+	case err != nil:
+		return providerObservationFailure
+	default:
+		return providerObservationSuccess
+	}
+}
+
+func parseRetryAfter(header http.Header, now time.Time) time.Duration {
+	if header == nil {
+		return 0
+	}
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
+
+type envSecretLoader struct {
+	keys map[minimaxauth.KeyAlias][]byte
+}
+
+func newEnvSecretLoader(bindings []apiKeyBinding) *envSecretLoader {
+	keys := make(map[minimaxauth.KeyAlias][]byte, len(bindings))
+	for _, binding := range bindings {
+		keys[binding.alias] = []byte(binding.key)
+	}
+	return &envSecretLoader{keys: keys}
+}
+
+func (l *envSecretLoader) Load(_ context.Context, alias minimaxauth.KeyAlias) ([]byte, error) {
+	key, ok := l.keys[alias]
+	if !ok {
+		return nil, fmt.Errorf("missing MiniMax API key for alias %s", alias)
+	}
+	return append([]byte(nil), key...), nil
 }
 
 func decodeEmbeddingResponse(raw []byte) (minimaxEmbeddingResponse, error) {
@@ -213,18 +447,8 @@ func decodeEmbeddingResponse(raw []byte) (minimaxEmbeddingResponse, error) {
 }
 
 func isProviderRetryable(status int, raw []byte, err error) bool {
-	if status == http.StatusTooManyRequests || status == http.StatusPaymentRequired || status == http.StatusForbidden {
-		return true
-	}
-	lower := strings.ToLower(string(raw))
-	if err != nil {
-		lower += " " + strings.ToLower(err.Error())
-	}
-	return strings.Contains(lower, "quota") ||
-		strings.Contains(lower, "rate limit") ||
-		strings.Contains(lower, "rate_limit") ||
-		strings.Contains(lower, "too many requests") ||
-		strings.Contains(lower, "insufficient balance")
+	observation := classifyProviderObservation(status, raw, err)
+	return observation == providerObservationRateLimited || observation == providerObservationQuotaExhausted
 }
 
 func normalizeInput(input any) ([]string, error) {

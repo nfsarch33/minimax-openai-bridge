@@ -2,11 +2,15 @@ package bridge
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/nfsarch33/runx/pkg/minimaxauth"
 )
 
 func TestEmbeddingsTranslateOpenAIRequestToMiniMax(t *testing.T) {
@@ -132,6 +136,158 @@ func TestChatCompletionsFallbackToSecondKeyOnQuota(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsSharedSelectorRecordsRateLimitAndSuccess(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 7, 11, 0, 0, 0, time.UTC)
+	events := &captureEventWriter{}
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		if len(auths) == 1 {
+			http.Error(w, "rate limit", http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(minimaxEmbeddingResponse{
+			Vectors:  [][]float64{{0.7, 0.8}},
+			BaseResp: minimaxBaseResp{StatusCode: 0},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := NewServer(Config{
+		MiniMaxBaseURL: upstream.URL + "/v1",
+		APIKeys:        []string{"key-1", "key-2"},
+		Model:          "embo-01",
+		DefaultType:    "db",
+		Timeout:        time.Second,
+		EventWriter:    events,
+		Clock:          func() time.Time { return now },
+	}, upstream.Client(), nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"input":"alpha"}`))
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if len(auths) != 2 || auths[0] != "Bearer key-1" || auths[1] != "Bearer key-2" {
+		t.Fatalf("auths = %#v", auths)
+	}
+	gotEvents := events.snapshot()
+	if len(gotEvents) != 2 {
+		t.Fatalf("events = %#v, want rate-limit + success", gotEvents)
+	}
+	if gotEvents[0].Alias != "minimax-api-1" || gotEvents[0].Kind != minimaxauth.EventRateLimited {
+		t.Fatalf("first event = %#v, want minimax-api-1 rate_limited", gotEvents[0])
+	}
+	if gotEvents[1].Alias != "minimax-api-2" || gotEvents[1].Kind != minimaxauth.EventSuccess {
+		t.Fatalf("second event = %#v, want minimax-api-2 success", gotEvents[1])
+	}
+}
+
+func TestEmbeddingsQuotaExhaustionSkipsAliasOnLaterRequest(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 7, 11, 0, 0, 0, time.UTC)
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer key-1" {
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(`{"error":"quota exhausted"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(minimaxEmbeddingResponse{
+			Vectors:  [][]float64{{0.7, 0.8}},
+			BaseResp: minimaxBaseResp{StatusCode: 0},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := NewServer(Config{
+		MiniMaxBaseURL: upstream.URL + "/v1",
+		APIKeys:        []string{"key-1", "key-2"},
+		Model:          "embo-01",
+		DefaultType:    "db",
+		Timeout:        time.Second,
+		Clock:          func() time.Time { return now },
+	}, upstream.Client(), nil)
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"input":"alpha"}`))
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, body=%s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	want := []string{"Bearer key-1", "Bearer key-2", "Bearer key-2"}
+	if len(auths) != len(want) {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	for i := range want {
+		if auths[i] != want[i] {
+			t.Fatalf("auths = %#v, want %#v", auths, want)
+		}
+	}
+}
+
+func TestEmbeddingsRateLimitedAliasRecoversAfterBackoff(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 5, 7, 11, 0, 0, 0, time.UTC)
+	now := start
+	key1Failures := 0
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer key-1" && key1Failures == 0 {
+			key1Failures++
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "rate limit", http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(minimaxEmbeddingResponse{
+			Vectors:  [][]float64{{0.7, 0.8}},
+			BaseResp: minimaxBaseResp{StatusCode: 0},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := NewServer(Config{
+		MiniMaxBaseURL:  upstream.URL + "/v1",
+		APIKeys:         []string{"key-1", "key-2"},
+		Model:           "embo-01",
+		DefaultType:     "db",
+		Timeout:         time.Second,
+		SelectorBackoff: time.Minute,
+		Clock:           func() time.Time { return now },
+	}, upstream.Client(), nil)
+
+	for _, advance := range []time.Duration{0, 30 * time.Second, 90 * time.Second} {
+		now = start.Add(advance)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"input":"alpha"}`))
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("advance %s status = %d, body=%s", advance, rec.Code, rec.Body.String())
+		}
+	}
+
+	want := []string{"Bearer key-1", "Bearer key-2", "Bearer key-2", "Bearer key-1"}
+	if len(auths) != len(want) {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	for i := range want {
+		if auths[i] != want[i] {
+			t.Fatalf("auths = %#v, want %#v", auths, want)
+		}
+	}
+}
+
 func TestNormalizeInputRejectsInvalidShape(t *testing.T) {
 	t.Parallel()
 	if _, err := normalizeInput(float64(1)); err == nil {
@@ -158,4 +314,49 @@ func TestLoadAPIKeysFiltersPlaceholdersAndDuplicates(t *testing.T) {
 			t.Fatalf("keys = %#v, want %#v", got, want)
 		}
 	}
+}
+
+func TestLoadAPIKeyBindingsPreservesEnvKeySupport(t *testing.T) {
+	t.Setenv("MINIMAX_API_KEYS", "key-1, TODO_PLACEHOLDER, key-2")
+	t.Setenv("MINIMAX_API_KEY_1", "key-1")
+	t.Setenv("MINIMAX_API_KEY_2", "key-3")
+	t.Setenv("MINIMAX_API_KEY", "key-2")
+
+	got := loadAPIKeyBindings()
+	want := []apiKeyBinding{
+		{alias: "minimax-api-1", key: "key-1"},
+		{alias: "minimax-api-2", key: "key-2"},
+		{alias: "minimax-api-3", key: "key-3"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("bindings = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("bindings = %#v, want %#v", got, want)
+		}
+	}
+}
+
+type captureEventWriter struct {
+	mu     sync.Mutex
+	events []minimaxauth.Event
+}
+
+func (w *captureEventWriter) Write(e minimaxauth.Event) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if e.Alias == "" || e.Kind == "" {
+		return errors.New("event missing alias or kind")
+	}
+	w.events = append(w.events, e)
+	return nil
+}
+
+func (w *captureEventWriter) Close() error { return nil }
+
+func (w *captureEventWriter) snapshot() []minimaxauth.Event {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]minimaxauth.Event(nil), w.events...)
 }
