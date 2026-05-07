@@ -288,6 +288,96 @@ func TestEmbeddingsRateLimitedAliasRecoversAfterBackoff(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsRateLimitedAliasHonorsHTTPDateRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 5, 7, 11, 0, 0, 0, time.UTC)
+	now := start
+	key1Failures := 0
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer key-1" && key1Failures == 0 {
+			key1Failures++
+			w.Header().Set("Retry-After", start.Add(2*time.Minute).Format(http.TimeFormat))
+			http.Error(w, "rate limit", http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(minimaxEmbeddingResponse{
+			Vectors:  [][]float64{{0.7, 0.8}},
+			BaseResp: minimaxBaseResp{StatusCode: 0},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := NewServer(Config{
+		MiniMaxBaseURL:  upstream.URL + "/v1",
+		APIKeys:         []string{"key-1", "key-2"},
+		Model:           "embo-01",
+		DefaultType:     "db",
+		Timeout:         time.Second,
+		SelectorBackoff: time.Second,
+		Clock:           func() time.Time { return now },
+	}, upstream.Client(), nil)
+
+	for _, advance := range []time.Duration{0, time.Minute, 3 * time.Minute} {
+		now = start.Add(advance)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"input":"alpha"}`))
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("advance %s status = %d, body=%s", advance, rec.Code, rec.Body.String())
+		}
+	}
+
+	want := []string{"Bearer key-1", "Bearer key-2", "Bearer key-2", "Bearer key-1"}
+	if len(auths) != len(want) {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	for i := range want {
+		if auths[i] != want[i] {
+			t.Fatalf("auths = %#v, want %#v", auths, want)
+		}
+	}
+}
+
+func TestChatCompletionsRecordsQuotaEventsWhenAllAliasesExhausted(t *testing.T) {
+	t.Parallel()
+
+	events := &captureEventWriter{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":"quota exhausted"}`))
+	}))
+	defer upstream.Close()
+
+	srv := NewServer(Config{
+		MiniMaxBaseURL: upstream.URL + "/v1",
+		APIKeys:        []string{"key-1", "key-2"},
+		Model:          "MiniMax-M2.1",
+		DefaultType:    "db",
+		Timeout:        time.Second,
+		EventWriter:    events,
+	}, upstream.Client(), nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"MiniMax-M2.1","messages":[]}`))
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", rec.Code, rec.Body.String())
+	}
+	gotEvents := events.snapshot()
+	if len(gotEvents) != 2 {
+		t.Fatalf("events = %#v, want one quota event per alias", gotEvents)
+	}
+	for i, event := range gotEvents {
+		if event.Kind != minimaxauth.EventQuotaExhausted {
+			t.Fatalf("event %d = %#v, want quota_exhausted", i, event)
+		}
+	}
+}
+
 func TestNormalizeInputRejectsInvalidShape(t *testing.T) {
 	t.Parallel()
 	if _, err := normalizeInput(float64(1)); err == nil {
