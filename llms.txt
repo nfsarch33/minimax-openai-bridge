@@ -1,0 +1,58 @@
+# minimax-openai-bridge
+
+> Go HTTP adapter that exposes an OpenAI-compatible embeddings endpoint and
+> translates requests to MiniMax embo-01. Enables Mem0 OSS and other
+> OpenAI-compatible clients to use MiniMax embeddings without learning the
+> MiniMax native schema.
+
+## Overview
+
+- Name: minimax-openai-bridge
+- Purpose: OpenAI-compatible HTTP adapter for MiniMax embeddings (embo-01) and chat completions; provides key-slot rotation on quota/rate-limit failures so Mem0 OSS can use a single base URL for both extraction and embeddings.
+- Language(s): Go
+- License: MIT
+- Authoritative README: <https://github.com/nfsarch33/minimax-openai-bridge#readme>
+- Source of truth branch: `main`
+
+## Quick Start
+
+- Build and run:
+  ```
+  go run ./cmd/minimax-openai-bridge
+  ```
+- Endpoints:
+  - `POST /v1/embeddings` — OpenAI-compatible embeddings
+  - `POST /v1/chat/completions` — proxied chat completions
+  - `GET /healthz` — health check
+- Configuration via environment variables:
+  - `BRIDGE_ADDR` (default `127.0.0.1:8500`)
+  - `MINIMAX_API_KEY_1`, `MINIMAX_API_KEY_2`, `MINIMAX_API_KEYS` — key slots with rotation
+  - `MINIMAX_EMBEDDING_MODEL` (default `embo-01`)
+- Run tests: `go test ./...`
+- Minimum runtime prerequisites: Go 1.22+
+
+## Key Concepts
+
+- OpenAI-compatible `/v1/embeddings` translates to MiniMax `{texts, type}` schema
+- Embedding type determined by `user` field: `db` for storage, `query` for search
+- Key-slot rotation: multiple API keys rotate on quota or rate-limit failures
+- Also proxies `/v1/chat/completions` for unified Mem0 base URL
+
+## Runnable Examples
+
+- Run bridge: `go run ./cmd/minimax-openai-bridge`
+- Test: `go test ./...`
+
+## Related Repos
+
+- [mem0-mcp-go](https://github.com/nfsarch33/mem0-mcp-go) — Mem0 MCP server that uses this bridge for embeddings
+
+## Operational Notes
+
+- Issue tracker: <https://github.com/nfsarch33/minimax-openai-bridge/issues>
+- Keep MiniMax keys in environment variables only; never pass on argv
+
+---
+
+*This file follows the emerging `llms.txt` convention adopted by cloudwego/eino,
+Anthropic tooling, and others.*
