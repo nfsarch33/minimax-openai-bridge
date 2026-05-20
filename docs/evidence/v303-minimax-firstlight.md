@@ -45,7 +45,7 @@ Do not run live provider calls until:
 
 1. `MINIMAX_API_KEY_1` and `MINIMAX_API_KEY_2` are real values on the target host.
 2. The values are injected through the approved secret flow, never argv.
-3. `mem0-selfhost doctor` passes on the wsl1 Docker host.
+3. `mem0-selfhost doctor` passes on the your-host Docker host.
 4. The first-light request is run through the loopback Mem0 / MiniMax bridge path.
 
 ## Carry-forward

@@ -1,14 +1,14 @@
 # minimax-openai-bridge
 
-Go HTTP adapter that exposes an OpenAI-compatible embeddings endpoint and
-translates requests to MiniMax `embo-01`.
+Go HTTP adapter that exposes an OpenAI-compatible API and translates requests
+to MiniMax endpoints. Designed for Mem0 OSS integration.
 
-It exists so Mem0 OSS can use MiniMax embeddings without teaching every caller
-MiniMax's native `{texts, type}` schema.
+**Key features:**
 
-The bridge also proxies `POST /v1/chat/completions` so Mem0 can use a local
-OpenAI-compatible base URL for both extraction and embeddings. MiniMax key slots
-rotate on quota or rate-limit failures.
+- **Embedding translation**: converts OpenAI `POST /v1/embeddings` to MiniMax `embo-01` format
+- **Chat completions proxy**: forwards `POST /v1/chat/completions` to MiniMax
+- **`<think>` tag stripping**: removes `<think>...</think>` reasoning blocks from MiniMax M2.7-highspeed responses (both streaming and non-streaming) so downstream consumers like Mem0 OSS receive clean JSON
+- **Key rotation**: multiple API key slots with automatic failover on 429/quota errors
 
 ## API
 
@@ -50,9 +50,82 @@ The optional `user` field is used as the MiniMax embedding type:
 Keep all MiniMax keys in 1Password or target-host env only. Never pass them on
 argv.
 
+## Deployment on your-host (Mem0 OSS stack)
+
+### 1. Copy the linux binary
+
+```bash
+scp bin/minimax-openai-bridge-linux your-host:~/minimax-openai-bridge
+ssh your-host 'chmod +x ~/minimax-openai-bridge'
+```
+
+### 2. Create a systemd unit
+
+```bash
+# /etc/systemd/system/minimax-openai-bridge.service
+[Unit]
+Description=MiniMax OpenAI Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=jason
+ExecStart=/home/jason/minimax-openai-bridge
+Environment=BRIDGE_ADDR=127.0.0.1:8500
+Environment=MINIMAX_BASE_URL=https://api.minimaxi.com/v1
+EnvironmentFile=/home/jason/.config/minimax-bridge/env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Put API keys in `/home/jason/.config/minimax-bridge/env`:
+```
+MINIMAX_API_KEY_1=<from 1Password: <vault-name> / <item-name> / api-key>
+MINIMAX_API_KEY_2=<from 1Password: <vault-name> / <item-name> / api-key>
+```
+
+### 3. Update Mem0 OSS to point LLM at the bridge
+
+In the Mem0 OSS Docker stack `.env` on your-host:
+```
+LLM_PROVIDER=openai
+LLM_BASE_URL=http://127.0.0.1:8500/v1
+LLM_API_KEY=unused-bridge-handles-auth
+LLM_MODEL=MiniMax-M2.7-highspeed
+EMBEDDING_PROVIDER=openai
+EMBEDDING_BASE_URL=http://127.0.0.1:8500/v1
+EMBEDDING_API_KEY=unused-bridge-handles-auth
+EMBEDDING_MODEL=embo-01
+```
+
+### 4. Enable and start
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now minimax-openai-bridge
+sudo systemctl restart mem0  # or docker compose restart
+```
+
+### 5. Verify
+
+```bash
+curl http://127.0.0.1:8500/healthz
+# Expected: ok
+```
+
 ## Development
 
 ```bash
-go test ./...
+go test -race ./...
 go run ./cmd/minimax-openai-bridge
+make build           # darwin binary
+make docker-build    # Docker image
+```
+
+Cross-compile for linux:
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/minimax-openai-bridge-linux ./cmd/minimax-openai-bridge
 ```

@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -180,15 +181,112 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	if isStreamingRequest(body) {
+		s.handleStreamingChat(w, r, body)
+		return
+	}
 	raw, status, err := s.postMiniMax(r.Context(), "chat/completions", body)
 	if err != nil {
 		s.log.Error("minimax chat completion failed", "err", err)
 		http.Error(w, "chat provider failed", http.StatusBadGateway)
 		return
 	}
+	cleaned := StripThinkTagsFromChatResponse(raw)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(raw)
+	_, _ = w.Write(cleaned)
+}
+
+func (s *Server) handleStreamingChat(w http.ResponseWriter, r *http.Request, body []byte) {
+	if s.maxAttempts() == 0 {
+		http.Error(w, "missing MiniMax API keys", http.StatusBadGateway)
+		return
+	}
+	alias, err := s.pickAlias()
+	if err != nil {
+		http.Error(w, "no available API key", http.StatusBadGateway)
+		return
+	}
+	apiKey, err := s.secrets.Load(r.Context(), alias)
+	if err != nil {
+		http.Error(w, "api key load failed", http.StatusBadGateway)
+		return
+	}
+
+	endpoint, err := url.JoinPath(strings.TrimRight(s.cfg.MiniMaxBaseURL, "/"), "chat/completions")
+	if err != nil {
+		http.Error(w, "endpoint error", http.StatusInternalServerError)
+		return
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		http.Error(w, "endpoint parse error", http.StatusInternalServerError)
+		return
+	}
+	if s.cfg.GroupID != "" {
+		q := u.Query()
+		q.Set("GroupId", s.cfg.GroupID)
+		u.RawQuery = q.Encode()
+	}
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "request build failed", http.StatusInternalServerError)
+		return
+	}
+	upReq.Header.Set("Authorization", "Bearer "+string(apiKey))
+	upReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(upReq)
+	if err != nil {
+		s.log.Error("minimax streaming chat failed", "err", err)
+		http.Error(w, "chat provider failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		observation := classifyProviderObservation(resp.StatusCode, raw, nil)
+		_ = s.recordObservation(alias, observation, resp.Header)
+		http.Error(w, "chat provider failed", http.StatusBadGateway)
+		return
+	}
+
+	_ = s.auth.RecordSuccess(alias, s.clock())
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, canFlush := w.(http.Flusher)
+	filter := NewThinkFilter()
+	scanner := bufio.NewScanner(resp.Body)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		out := filter.ProcessSSELine(line)
+		if out == "" {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "%s\n\n", out)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+}
+
+func isStreamingRequest(body []byte) bool {
+	var req struct {
+		Stream bool `json:"stream"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return false
+	}
+	return req.Stream
 }
 
 func (s *Server) embed(ctx context.Context, model, embedType string, texts []string) ([][]float64, error) {

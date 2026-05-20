@@ -1,4 +1,4 @@
-package bridge
+package bridge // runx-public-repo-gate: allow-file secret_cred_ref — minimax-api-N is a runtime alias format required by the minimaxauth package
 
 import (
 	"os"
@@ -99,7 +99,7 @@ func appendBinding(bindings []apiKeyBinding, key string) []apiKeyBinding {
 			return bindings
 		}
 	}
-	alias := minimaxauth.KeyAlias("minimax-api-" + strconv.Itoa(len(bindings)+1))
+	alias := minimaxauth.KeyAlias("minimax-api-" + strconv.Itoa(len(bindings)+1)) // runx-public-repo-gate: allow secret_cred_ref — runtime alias required by minimaxauth package
 	return append(bindings, apiKeyBinding{alias: alias, key: key})
 }
 

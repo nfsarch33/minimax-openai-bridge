@@ -1,4 +1,4 @@
-package bridge
+package bridge // runx-public-repo-gate: allow-file secret_cred_ref — minimax-api-N aliases are runtime values required by the minimaxauth package, not 1Password item names
 
 import (
 	"encoding/json"
@@ -178,10 +178,10 @@ func TestEmbeddingsSharedSelectorRecordsRateLimitAndSuccess(t *testing.T) {
 	if len(gotEvents) != 2 {
 		t.Fatalf("events = %#v, want rate-limit + success", gotEvents)
 	}
-	if gotEvents[0].Alias != "minimax-api-1" || gotEvents[0].Kind != minimaxauth.EventRateLimited {
+	if gotEvents[0].Alias != "minimax-api-1" || gotEvents[0].Kind != minimaxauth.EventRateLimited { // runx-public-repo-gate: allow secret_cred_ref — runtime alias from minimaxauth
 		t.Fatalf("first event = %#v, want minimax-api-1 rate_limited", gotEvents[0])
 	}
-	if gotEvents[1].Alias != "minimax-api-2" || gotEvents[1].Kind != minimaxauth.EventSuccess {
+	if gotEvents[1].Alias != "minimax-api-2" || gotEvents[1].Kind != minimaxauth.EventSuccess { // runx-public-repo-gate: allow secret_cred_ref — runtime alias from minimaxauth
 		t.Fatalf("second event = %#v, want minimax-api-2 success", gotEvents[1])
 	}
 }
@@ -413,7 +413,7 @@ func TestLoadAPIKeyBindingsPreservesEnvKeySupport(t *testing.T) {
 	t.Setenv("MINIMAX_API_KEY", "key-2")
 
 	got := loadAPIKeyBindings()
-	want := []apiKeyBinding{
+	want := []apiKeyBinding{ // runx-public-repo-gate: allow secret_cred_ref — runtime aliases from minimaxauth
 		{alias: "minimax-api-1", key: "key-1"},
 		{alias: "minimax-api-2", key: "key-2"},
 		{alias: "minimax-api-3", key: "key-3"},
