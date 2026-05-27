@@ -47,8 +47,8 @@ The optional `user` field is used as the MiniMax embedding type:
 | `MINIMAX_EMBEDDING_MODEL` | `embo-01` | Embedding model. |
 | `MINIMAX_EMBEDDING_TYPE` | `db` | Default MiniMax embedding type. |
 
-Keep all MiniMax keys in 1Password or target-host env only. Never pass them on
-argv.
+Keep all MiniMax keys in a secrets manager or host-local env files. Never pass
+them on argv.
 
 ## Deployment on your-host (Mem0 OSS stack)
 
@@ -69,11 +69,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=jason
-ExecStart=/home/jason/minimax-openai-bridge
+User=<your-user>
+ExecStart=/home/<your-user>/minimax-openai-bridge
 Environment=BRIDGE_ADDR=127.0.0.1:8500
 Environment=MINIMAX_BASE_URL=https://api.minimaxi.com/v1
-EnvironmentFile=/home/jason/.config/minimax-bridge/env
+EnvironmentFile=/home/<your-user>/.config/minimax-bridge/env
 Restart=always
 RestartSec=5
 
@@ -81,10 +81,10 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Put API keys in `/home/jason/.config/minimax-bridge/env`:
+Put API keys in `~/.config/minimax-bridge/env`:
 ```
-MINIMAX_API_KEY_1=<from 1Password: <vault-name> / <item-name> / api-key>
-MINIMAX_API_KEY_2=<from 1Password: <vault-name> / <item-name> / api-key>
+MINIMAX_API_KEY_1=<your-primary-key>
+MINIMAX_API_KEY_2=<your-secondary-key>
 ```
 
 ### 3. Update Mem0 OSS to point LLM at the bridge
@@ -129,3 +129,7 @@ Cross-compile for linux:
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/minimax-openai-bridge-linux ./cmd/minimax-openai-bridge
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
