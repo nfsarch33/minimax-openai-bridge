@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nfsarch33/runx/pkg/minimaxauth"
+	"github.com/nfsarch33/minimax-openai-bridge/internal/minimaxauth"
 )
 
 type Config struct {
