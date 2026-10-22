@@ -1,14 +1,15 @@
 # minimax-openai-bridge
 
-Go HTTP adapter that exposes an OpenAI-compatible API and translates requests
-to MiniMax endpoints. Designed for Mem0 OSS integration.
+Go HTTP adapter that exposes an OpenAI-compatible API in front of MiniMax, so
+any client that speaks the OpenAI `/v1/embeddings` and `/v1/chat/completions`
+shapes can use MiniMax models without a MiniMax-specific SDK.
 
 **Key features:**
 
 - **Embedding translation**: converts OpenAI `POST /v1/embeddings` to MiniMax `embo-01` format
 - **Chat completions proxy**: forwards `POST /v1/chat/completions` to MiniMax
-- **`<think>` tag stripping**: removes `<think>...</think>` reasoning blocks from MiniMax M2.7-highspeed responses (both streaming and non-streaming) so downstream consumers like Mem0 OSS receive clean JSON
-- **Key rotation**: multiple API key slots with automatic failover on 429/quota errors
+- **`<think>` tag stripping**: removes `<think>...</think>` reasoning blocks from MiniMax M2.7-highspeed responses (both streaming and non-streaming) so OpenAI-style clients receive clean JSON (`internal/bridge/think.go`)
+- **Key rotation**: multiple API key slots with automatic failover on 429 / quota / payment-required responses for embeddings and non-streaming chat; key selection state and an NDJSON audit log live in `internal/minimaxauth`
 
 ## API
 
@@ -46,11 +47,14 @@ The optional `user` field is used as the MiniMax embedding type:
 | `MINIMAX_GROUP_ID` | empty | Optional MiniMax group ID query parameter. |
 | `MINIMAX_EMBEDDING_MODEL` | `embo-01` | Embedding model. |
 | `MINIMAX_EMBEDDING_TYPE` | `db` | Default MiniMax embedding type. |
+| `MINIMAX_TIMEOUT` | `30s` | Upstream HTTP client timeout (Go duration). |
+| `MINIMAX_SELECTOR_BACKOFF` | `1m` | Backoff applied to a rate-limited or quota-exhausted key slot (Go duration). |
+| `MINIMAX_EVENT_LOG` | `$HOME/logs/...` | NDJSON key-selection audit log path (default under `$HOME/logs/`). |
 
 Keep all MiniMax keys in a secrets manager or host-local env files. Never pass
 them on argv.
 
-## Deployment on your-host (Mem0 OSS stack)
+## Deployment (systemd example)
 
 ### 1. Copy the linux binary
 
@@ -87,48 +91,43 @@ MINIMAX_API_KEY_1=<your-primary-key>
 MINIMAX_API_KEY_2=<your-secondary-key>
 ```
 
-### 3. Update Mem0 OSS to point LLM at the bridge
-
-In the Mem0 OSS Docker stack `.env` on your-host:
-```
-LLM_PROVIDER=openai
-LLM_BASE_URL=http://127.0.0.1:8500/v1
-LLM_API_KEY=unused-bridge-handles-auth
-LLM_MODEL=MiniMax-M2.7-highspeed
-EMBEDDING_PROVIDER=openai
-EMBEDDING_BASE_URL=http://127.0.0.1:8500/v1
-EMBEDDING_API_KEY=unused-bridge-handles-auth
-EMBEDDING_MODEL=embo-01
-```
-
-### 4. Enable and start
+### 3. Enable and start
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now minimax-openai-bridge
-sudo systemctl restart mem0  # or docker compose restart
 ```
 
-### 5. Verify
+### 4. Verify
 
 ```bash
 curl http://127.0.0.1:8500/healthz
 # Expected: ok
 ```
 
+Point any OpenAI-compatible client at `http://127.0.0.1:8500/v1`; the bridge
+holds the MiniMax keys, so the client API key can be any placeholder.
+
 ## Development
 
 ```bash
 go test -race ./...
 go run ./cmd/minimax-openai-bridge
-make build           # darwin binary
-make docker-build    # Docker image
+make build           # CGO_ENABLED=0 binary for the host platform -> bin/minimax-openai-bridge
+make docker-build    # container image (golang:1.27-alpine builder, scratch runtime, port 8500)
+./bin/minimax-openai-bridge --version
 ```
 
 Cross-compile for linux:
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/minimax-openai-bridge-linux ./cmd/minimax-openai-bridge
 ```
+
+## Build notes
+
+The key-selection package is vendored under `internal/minimaxauth`, so public
+builds need only this repository and the Go version in `go.mod` (1.27.0). No
+private module is required.
 
 ## License
 
